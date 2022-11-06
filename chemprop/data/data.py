@@ -11,11 +11,28 @@ from .scaler import StandardScaler
 from chemprop.features import get_features_generator
 from chemprop.features import BatchMolGraph, MolGraph
 from chemprop.features import is_explicit_h, is_reaction, is_adding_hs, is_mol
-from chemprop.rdkit import make_mol
+#from chemprop.rdkit import make_mol
 
 # Cache of graph featurizations
 CACHE_GRAPH = True
 SMILES_TO_GRAPH: Dict[str, MolGraph] = {}
+
+def make_mol(s: str, keep_h: bool, add_h: bool):
+    """
+    Builds an RDKit molecule from a SMILES string.
+    
+    :param s: SMILES string.
+    :param keep_h: Boolean whether to keep hydrogens in the input smiles. This does not add hydrogens, it only keeps them if they are specified.
+    :return: RDKit molecule.
+    """
+    if keep_h:
+        mol = Chem.MolFromSmiles(s, sanitize = False)
+        Chem.SanitizeMol(mol, sanitizeOps = Chem.SanitizeFlags.SANITIZE_ALL^Chem.SanitizeFlags.SANITIZE_ADJUSTHS)
+    else:
+        mol = Chem.MolFromSmiles(s)
+    if add_h:
+        mol = Chem.AddHs(mol)
+    return mol
 
 
 def cache_graph() -> bool:
