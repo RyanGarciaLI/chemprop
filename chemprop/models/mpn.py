@@ -10,6 +10,24 @@ from chemprop.args import TrainArgs
 from chemprop.features import BatchMolGraph, get_atom_fdim, get_bond_fdim, mol2graph
 from chemprop.nn_utils import index_select_ND, get_activation_function
 
+def unsorted_segment_sum(data, segment_ids, num_segments):
+    result_shape = (num_segments, data.size(1))
+    result = data.new_full(result_shape, 0)  # Init empty result tensor.
+    segment_ids = segment_ids.unsqueeze(-1).expand(-1, data.size(1))
+    result.scatter_add_(0, segment_ids, data)
+    return result
+
+
+def unsorted_segment_mean(data, segment_ids, num_segments):
+    result_shape = (num_segments, data.size(1))
+    segment_ids = segment_ids.unsqueeze(-1).expand(-1, data.size(1))
+    result = data.new_full(result_shape, 0)  # Init empty result tensor.
+    count = data.new_full(result_shape, 0)
+    result.scatter_add_(0, segment_ids, data)
+    count.scatter_add_(0, segment_ids, torch.ones_like(data))
+    return result / count.clamp(min=1)
+
+
 
 class MPNEncoder(nn.Module):
     """An :class:`MPNEncoder` is a message passing neural network for encoding a molecule."""
@@ -61,11 +79,83 @@ class MPNEncoder(nn.Module):
 
         self.W_o = nn.Linear(self.atom_fdim + self.hidden_size, self.hidden_size)
 
+        # Equvariant Graph Convolution Layer
+        self.input_edge = 0 # TODO: add node attributes
+        self.edge_coords_dim = 1
+        self.edges_feat_dim = self.hidden_size
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(self.input_edge + self.edge_coords_dim + self.edges_feat_dim, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.SiLU(),
+        )
+
+        self.input_nf = self.hidden_size #TODO number of nodes
+        self.output_size = self.hidden_size
+        self.node_mlp = nn.Sequential(
+            nn.Linear(self.hidden_size + self.input_nf, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, self.output_size)
+        )
+
+        layer = nn.Linear(self.hidden_size, 1, bias=False)
+        torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
+        self.coord_mlp = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.SiLU(),
+            layer,
+            #nn.Tanh()
+        )
+
+        self.att_mlp = nn.Sequential(
+            nn.Linear(self.hidden_size, 1),
+            nn.Sigmoid()
+        )
+
+        self.epsilon = 1e-8
+
         # layer after concatenating the descriptors if args.atom_descriptors == descriptors
         if args.atom_descriptors == 'descriptor':
             self.atom_descriptors_size = args.atom_descriptors_size
             self.atom_descriptors_layer = nn.Linear(self.hidden_size + self.atom_descriptors_size,
                                                     self.hidden_size + self.atom_descriptors_size,)
+
+    def edge_model(self, source, target, radial, edge_attr):
+        if source is None or target is None:
+            out = torch.cat([radial, edge_attr], dim=1)
+        else:
+            out = torch.cat([source, target, radial, edge_attr], dim=1)
+        out = self.edge_mlp(out)
+        return out
+
+    def node_model(self, b2a, edge_attr, node_attr):
+
+        agg = unsorted_segment_sum(edge_attr, b2a, num_segments=x.size(0))
+        agg = torch.cat([agg], dim=1) if node_attr is None else torch.cat([agg, node_attr], dim=1)
+        out = self.node_mlp(agg)
+        return out, agg
+
+    def coord_model(self, coord, b2a, coord_diff, edge_feat):  
+        trans = coord_diff * self.coord_mlp(edge_feat)
+        agg = unsorted_segment_mean(trans, b2a, num_segments=coord.size(0))
+        coord += agg
+        return coord
+
+    def coord2radial(self, b2a, b2revb, coords):
+        srcCoords = coords[b2a]
+        dstCoords = coords[b2a[b2revb]]
+        coord_diff = srcCoords - dstCoords
+        radial = torch.sum(coord_diff**2, 1).unsqueeze(1)
+        # print(coord_diff.shape)
+        # print(radial.shape)
+
+        # if self.normalize:
+        if True:
+            norm = torch.sqrt(radial).detach() + self.epsilon
+            coord_diff = coord_diff / norm
+
+        return radial, coord_diff
+
 
     def forward(self,
                 mol_graph: BatchMolGraph,
@@ -82,11 +172,17 @@ class MPNEncoder(nn.Module):
             atom_descriptors_batch = [np.zeros([1, atom_descriptors_batch[0].shape[1]])] + atom_descriptors_batch   # padding the first with 0 to match the atom_hiddens
             atom_descriptors_batch = torch.from_numpy(np.concatenate(atom_descriptors_batch, axis=0)).float().to(self.device)
 
-        f_atoms, f_bonds, a2b, b2a, b2revb, a_scope, b_scope = mol_graph.get_components(atom_messages=self.atom_messages)
-        f_atoms, f_bonds, a2b, b2a, b2revb = f_atoms.to(self.device), f_bonds.to(self.device), a2b.to(self.device), b2a.to(self.device), b2revb.to(self.device)
+        f_atoms, f_bonds, a2b, b2a, b2revb, a_scope, b_scope, coords = mol_graph.get_components(atom_messages=self.atom_messages)
+        f_atoms, f_bonds, a2b, b2a, b2revb, coords = f_atoms.to(self.device), f_bonds.to(self.device), a2b.to(self.device), b2a.to(self.device), b2revb.to(self.device), coords.to(self.device)
 
-        if self.atom_messages:
+        # if self.atom_messages: #TODO
+        if True:
             a2a = mol_graph.get_a2a().to(self.device)
+
+        # shape_f_atoms = f_atoms.shape
+        # shape_a2b = a2b.shape
+        # shape_b2a = b2a.shape
+        # shape_b2revb = b2revb.shape
 
         # Input
         if self.atom_messages:
@@ -97,6 +193,8 @@ class MPNEncoder(nn.Module):
 
         # Message passing
         for depth in range(self.depth - 1):
+            radial, coord_diff = self.coord2radial(b2a, b2revb, coords)
+
             if self.undirected:
                 message = (message + message[b2revb]) / 2
 
@@ -106,6 +204,8 @@ class MPNEncoder(nn.Module):
                 nei_message = torch.cat((nei_a_message, nei_f_bonds), dim=2)  # num_atoms x max_num_bonds x hidden + bond_fdim
                 message = nei_message.sum(dim=1)  # num_atoms x hidden + bond_fdim
             else:
+                message = self.edge_model(None, None, radial, message)
+                coords = self.coord_model(coords, b2a, coord_diff, message)
                 # m(a1 -> a2) = [sum_{a0 \in nei(a1)} m(a0 -> a1)] - m(a2 -> a1)
                 # message      a_message = sum(nei_a_message)      rev_message
                 nei_a_message = index_select_ND(message, a2b)  # num_atoms x max_num_bonds x hidden
@@ -114,7 +214,8 @@ class MPNEncoder(nn.Module):
                 message = a_message[b2a] - rev_message  # num_bonds x hidden
 
             message = self.W_h(message)
-            message = self.act_func(input + message)  # num_bonds x hidden_size
+            #message = self.act_func(input + message)  # num_bonds x hidden_size
+            message = nn.SiLU()(input + message)
             message = self.dropout_layer(message)  # num_bonds x hidden
 
         a2x = a2a if self.atom_messages else a2b

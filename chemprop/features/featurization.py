@@ -357,9 +357,12 @@ class MolGraph:
         self.overwrite_default_atom_features = overwrite_default_atom_features
         self.overwrite_default_bond_features = overwrite_default_bond_features
 
+        self.coords = [] # atom coordinates
+
         if not self.is_reaction:
             # Get atom features
             self.f_atoms = [atom_features(atom) for atom in mol.GetAtoms()]
+            
             if atom_features_extra is not None:
                 if overwrite_default_atom_features:
                     self.f_atoms = [descs.tolist() for descs in atom_features_extra]
@@ -370,6 +373,31 @@ class MolGraph:
             if atom_features_extra is not None and len(atom_features_extra) != self.n_atoms:
                 raise ValueError(f'The number of atoms in {Chem.MolToSmiles(mol)} is different from the length of '
                                  f'the extra atom features')
+            
+            # TODO: 3D Coordinate: fix bugs of embedding
+            # mol = Chem.AddHs(mol)
+            # embedFlag = Chem.AllChem.EmbedMolecule(mol)
+            # # assert embedFlag != -1
+            # if embedFlag != -1:
+            #     for i, atom in enumerate(mol.GetAtoms()):
+            #         pos = mol.GetConformer().GetAtomPosition(i)     
+            #         self.coords.append([pos.x, pos.y, pos.z])
+            # elif Chem.AllChem.EmbedMolecule(mol, useRandomCoords=True) != -1:
+            #     for i, atom in enumerate(mol.GetAtoms()):
+            #         pos = mol.GetConformer().GetAtomPosition(i)     
+            #         self.coords.append([pos.x, pos.y, pos.z])
+            # else:
+            #     badMol = Chem.MolToSmiles(mol,isomericSmiles=False)
+            #     print(badMol) #TODO
+
+            # mol = Chem.RemoveHs(mol)
+
+            # 2D Coordinate
+            Chem.AllChem.Compute2DCoords(mol)
+            for i, atom in enumerate(mol.GetAtoms()):
+                pos2D = mol.GetConformer().GetAtomPosition(i)
+                self.coords.append(list(pos2D)[:-1])
+                
 
             # Initialize atom to bond mapping for each atom
             for _ in range(self.n_atoms):
@@ -547,6 +575,7 @@ class BatchMolGraph:
         a2b = [[]]  # mapping from atom index to incoming bond indices
         b2a = [0]  # mapping from bond index to the index of the atom the bond is coming from
         b2revb = [0]  # mapping from bond index to the index of the reverse bond
+        coords = [[0.0, 0.0]]
         for mol_graph in mol_graphs:
             f_atoms.extend(mol_graph.f_atoms)
             f_bonds.extend(mol_graph.f_bonds)
@@ -562,6 +591,7 @@ class BatchMolGraph:
             self.b_scope.append((self.n_bonds, mol_graph.n_bonds))
             self.n_atoms += mol_graph.n_atoms
             self.n_bonds += mol_graph.n_bonds
+            coords.extend(mol_graph.coords)
 
         self.max_num_bonds = max(1, max(
             len(in_bonds) for in_bonds in a2b))  # max with 1 to fix a crash in rare case of all single-heavy-atom mols
@@ -573,6 +603,8 @@ class BatchMolGraph:
         self.b2revb = torch.LongTensor(b2revb)
         self.b2b = None  # try to avoid computing b2b b/c O(n_atoms^3)
         self.a2a = None  # only needed if using atom messages
+        self.coords = torch.FloatTensor(coords)
+
 
     def get_components(self, atom_messages: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor,
                                                                    torch.LongTensor, torch.LongTensor, torch.LongTensor,
@@ -602,7 +634,7 @@ class BatchMolGraph:
         else:
             f_bonds = self.f_bonds
 
-        return self.f_atoms, f_bonds, self.a2b, self.b2a, self.b2revb, self.a_scope, self.b_scope
+        return self.f_atoms, f_bonds, self.a2b, self.b2a, self.b2revb, self.a_scope, self.b_scope, self.coords
 
     def get_b2b(self) -> torch.LongTensor:
         """
