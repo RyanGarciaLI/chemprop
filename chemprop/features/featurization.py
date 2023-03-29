@@ -375,7 +375,23 @@ class MolGraph:
                                  f'the extra atom features')
             
             # TODO: 3D Coordinate: fix bugs of embedding
-            # mol = Chem.AddHs(mol)
+            embedSucc = False
+            if Chem.AllChem.EmbedMolecule(mol) != -1:
+                embedSucc = True
+            elif Chem.AllChem.EmbedMolecule(mol, useRandomCoords = True) != -1:
+                embedSucc = True
+            elif Chem.AllChem.EmbedMolecule(mol, maxAttempts=5000, useRandomCoords = True) != -1:
+                embedSucc = True
+            
+            if embedSucc:
+                for i, atom in enumerate(mol.GetAtoms()):
+                    pos = mol.GetConformer().GetAtomPosition(i)     
+                    self.coords.append([pos.x, pos.y, pos.z])
+            else:
+                Chem.AllChem.Compute2DCoords(mol)
+                for i, atom in enumerate(mol.GetAtoms()):
+                    pos2D = mol.GetConformer().GetAtomPosition(i)
+                    self.coords.append(list(pos2D))
             # embedFlag = Chem.AllChem.EmbedMolecule(mol)
             # # assert embedFlag != -1
             # if embedFlag != -1:
@@ -393,10 +409,10 @@ class MolGraph:
             # mol = Chem.RemoveHs(mol)
 
             # 2D Coordinate
-            Chem.AllChem.Compute2DCoords(mol)
-            for i, atom in enumerate(mol.GetAtoms()):
-                pos2D = mol.GetConformer().GetAtomPosition(i)
-                self.coords.append(list(pos2D)[:-1])
+            # Chem.AllChem.Compute2DCoords(mol)
+            # for i, atom in enumerate(mol.GetAtoms()):
+            #     pos2D = mol.GetConformer().GetAtomPosition(i)
+            #     self.coords.append(list(pos2D)[:-1])
                 
 
             # Initialize atom to bond mapping for each atom
@@ -575,7 +591,7 @@ class BatchMolGraph:
         a2b = [[]]  # mapping from atom index to incoming bond indices
         b2a = [0]  # mapping from bond index to the index of the atom the bond is coming from
         b2revb = [0]  # mapping from bond index to the index of the reverse bond
-        coords = [[0.0, 0.0]]
+        coords = [[0.0, 0.0, 0.0]]
         for mol_graph in mol_graphs:
             f_atoms.extend(mol_graph.f_atoms)
             f_bonds.extend(mol_graph.f_bonds)
